@@ -1,207 +1,215 @@
 # xpost
 
-Post to X (Twitter) through a protected HTTP API.
+A command-line tool and HTTP API for posting to X (Twitter).
 
-## Quick Deploy (Recommended: Docker Compose + GHCR)
+## Installation
 
-`compose.yaml` already pulls the image from GHCR (`ghcr.io/missuo/xpost:latest`).
-
-1. Edit credentials in `compose.yaml` -> `services.xpost.environment`
-2. Start:
+### macOS (Homebrew)
 
 ```bash
-docker compose pull
-docker compose up -d
+brew install owo-network/brew/xpost
 ```
 
-3. Check health:
+### Linux / macOS (shell script)
 
 ```bash
-curl http://localhost:8080/healthz
+curl -fsSL https://raw.githubusercontent.com/missuo/xpost/main/install.sh | bash
 ```
 
-## Quick Deploy (docker run)
+### Docker
 
 ```bash
-docker run -d --name xpost \
-  -p 8080:8080 \
-  -e XPOST_ADDR=":8080" \
-  -e XPOST_CONFIG="/data/config.json" \
-  -e XPOST_API_TOKEN="replace-with-strong-token" \
-  -e X_API_KEY="replace-with-x-api-key" \
-  -e X_API_SECRET="replace-with-x-api-secret" \
-  -e X_ACCESS_TOKEN="replace-with-x-access-token" \
-  -e X_ACCESS_TOKEN_SECRET="replace-with-x-access-token-secret" \
-  -v xpost_data:/data \
-  ghcr.io/missuo/xpost:latest
+docker pull ghcr.io/missuo/xpost:latest
 ```
 
-## Vercel Deploy
+### Build from source
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/missuo/xpost&project-name=xpost&repository-name=xpost&env=XPOST_API_TOKEN,X_API_KEY,X_API_SECRET,X_ACCESS_TOKEN,X_ACCESS_TOKEN_SECRET)
+```bash
+go install github.com/missuo/xpost@latest
+```
 
-After import, set environment variables in Vercel:
+## Quick Start
 
-- `XPOST_API_TOKEN` (required)
-- `X_API_KEY` (required)
-- `X_API_SECRET` (required)
-- `X_ACCESS_TOKEN` (required)
-- `X_ACCESS_TOKEN_SECRET` (required)
+### 1. Create an X Developer App
 
-Then deploy and call your production domain directly.
+Go to [developer.x.com](https://developer.x.com) and create a new app. Enable **OAuth 2.0** under the authentication settings. Note your **Client ID**.
 
-## Required Environment Variables
+Add the following callback URL to your app:
 
-### API Protection (required)
+```
+http://localhost:9100
+```
 
-- `XPOST_API_TOKEN`
+### 2. Log in
 
-### X Credentials (required)
+```bash
+xpost login --client-id YOUR_CLIENT_ID
+```
 
-- `X_API_KEY`
-- `X_API_SECRET`
-- `X_ACCESS_TOKEN`
-- `X_ACCESS_TOKEN_SECRET`
+This opens your browser for authorization. After approving, the browser redirects to a URL starting with `http://localhost:9100?code=...`. Copy the full URL from your browser's address bar and paste it back into the terminal.
 
-### Optional
+Tokens are saved to `~/.config/xpost/config.json` and refresh automatically.
 
-- `XPOST_ADDR` (default `:8080`)
-- `XPOST_CONFIG` (default `config.json`)
+### 3. Post a tweet
 
-## How to Call the API
+```bash
+xpost tweet --text "Hello from xpost"
+```
 
-Protected endpoints require one header:
+With media (up to 4 files, 8 MB each):
+
+```bash
+xpost tweet --text "Check this out" --media photo.jpg
+xpost tweet --text "Two images" --media a.png --media b.png
+```
+
+## CLI Reference
+
+```
+xpost login     Authenticate via OAuth2
+xpost tweet     Post a tweet
+xpost serve     Start the HTTP API server
+xpost install   Install as a systemd service (Linux)
+xpost help      Show help
+```
+
+Running `xpost` with no arguments starts the HTTP server (same as `xpost serve`).
+
+### `xpost login`
+
+| Flag | Description |
+|------|-------------|
+| `--client-id` | OAuth2 Client ID (or `X_OAUTH2_CLIENT_ID` env) |
+| `--client-secret` | OAuth2 Client Secret, if applicable |
+| `--redirect-uri` | Callback URL (default `http://localhost:9100`) |
+| `--scope` | Comma-separated scopes (default `tweet.read,tweet.write,users.read,offline.access`) |
+| `--no-open` | Don't open the browser automatically |
+
+All flags are optional after the first login. Values are read from the saved config.
+
+### `xpost tweet`
+
+| Flag | Description |
+|------|-------------|
+| `--text` | Tweet text |
+| `--media` | Path to a media file (repeatable, max 4) |
+
+### `xpost install`
+
+Installs xpost as a systemd service. Requires `xpost login` to be run first.
+
+```bash
+sudo xpost install
+```
+
+| Flag | Description |
+|------|-------------|
+| `--bin` | Path to the xpost binary (default: current executable) |
+| `--user` | systemd `User=` value (default: caller of sudo) |
+| `--dry-run` | Print the unit file without installing |
+
+After installation:
+
+```bash
+sudo systemctl status xpost
+sudo systemctl restart xpost
+sudo journalctl -u xpost -f
+```
+
+## HTTP API
+
+Start the server with `xpost serve` or `sudo xpost install`. The API exposes a single endpoint:
+
+### `POST /v1/tweets`
+
+Requires an API token (auto-generated on first boot, stored in config):
 
 ```http
 Authorization: Bearer <XPOST_API_TOKEN>
 ```
 
-or
-
-```http
-X-API-Token: <XPOST_API_TOKEN>
-```
-
-## API Reference
-
-### `GET /healthz`
-
-No auth required.
-
-Response:
-
-```json
-{
-  "status": "ok"
-}
-```
-
-### `GET /v1/admin/config` (protected)
-
-Returns runtime status (without exposing secrets).
-
-Example:
+**JSON request:**
 
 ```bash
-curl -H "Authorization: Bearer <XPOST_API_TOKEN>" \
-  http://localhost:8080/v1/admin/config
+curl -X POST http://localhost:8080/v1/tweets \
+  -H "Authorization: Bearer $XPOST_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello from the API"}'
 ```
 
-### `PUT /v1/admin/auth` (protected)
-
-Updates X auth at runtime.
-
-Request body (non-empty subset):
-
-```json
-{
-  "api_key": "...",
-  "api_secret": "...",
-  "access_token": "...",
-  "access_token_secret": "...",
-  "oauth2_access_token": "..."
-}
-```
-
-Example:
+**JSON with base64 media:**
 
 ```bash
-curl -X PUT http://localhost:8080/v1/admin/auth \
-  -H "Authorization: Bearer <XPOST_API_TOKEN>" \
+curl -X POST http://localhost:8080/v1/tweets \
+  -H "Authorization: Bearer $XPOST_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "api_key":"...",
-    "api_secret":"...",
-    "access_token":"...",
-    "access_token_secret":"..."
+    "text": "With an image",
+    "media_base64": ["'$(base64 < photo.jpg)'"],
+    "media_content_types": ["image/jpeg"]
   }'
 ```
 
-### `POST /v1/admin/api-token/rotate` (protected)
-
-Rotate API protection token.
-
-Auto-generate:
-
-```bash
-curl -X POST http://localhost:8080/v1/admin/api-token/rotate \
-  -H "Authorization: Bearer <XPOST_API_TOKEN>"
-```
-
-Specify token:
-
-```bash
-curl -X POST http://localhost:8080/v1/admin/api-token/rotate \
-  -H "Authorization: Bearer <XPOST_API_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"api_token":"your-new-token"}'
-```
-
-### `POST /v1/tweets` (protected)
-
-Create text tweets or tweets with media.
-
-#### 1) JSON text-only
+**Multipart form upload:**
 
 ```bash
 curl -X POST http://localhost:8080/v1/tweets \
-  -H "Authorization: Bearer <XPOST_API_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Hello from xpost"}'
-```
-
-#### 2) JSON with base64 media
-
-```bash
-curl -X POST http://localhost:8080/v1/tweets \
-  -H "Authorization: Bearer <XPOST_API_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text":"Hello with image",
-    "media_base64":["<base64-image>"],
-    "media_content_types":["image/jpeg"]
-  }'
-```
-
-#### 3) multipart/form-data with file upload
-
-```bash
-curl -X POST http://localhost:8080/v1/tweets \
-  -H "X-API-Token: <XPOST_API_TOKEN>" \
+  -H "Authorization: Bearer $XPOST_API_TOKEN" \
   -F "text=Hello with upload" \
-  -F "media=@/absolute/path/image.jpg"
+  -F "media=@photo.jpg"
 ```
 
-## Limits
+## Docker Deployment
 
-- Max media files per request: `4`
-- Max media size per file: `8 MB`
+```bash
+docker run -d --name xpost \
+  -p 8080:8080 \
+  -e XPOST_API_TOKEN="your-secret-token" \
+  -e X_OAUTH2_ACCESS_TOKEN="..." \
+  -e X_OAUTH2_REFRESH_TOKEN="..." \
+  -e X_OAUTH2_CLIENT_ID="..." \
+  -e X_OAUTH2_CLIENT_SECRET="..." \
+  -e X_OAUTH2_REDIRECT_URI="http://localhost:9100" \
+  ghcr.io/missuo/xpost:latest
+```
 
-## Common Errors
+Or with Docker Compose — see [`compose.yaml`](compose.yaml).
 
-- `401 {"error":"invalid api token"}`
-- `503 {"error":"api token is not configured"}`
-- `503 {"error":"x client is not ready"}`
-- `400 {"error":"text or media is required"}`
-- `400 {"error":"too many media files, max is 4"}`
-- `502 {"error":"...x api error..."}`
+## Vercel Deployment
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/missuo/xpost&project-name=xpost&repository-name=xpost)
+
+Set these environment variables in the Vercel dashboard:
+
+- `XPOST_API_TOKEN`
+- `X_OAUTH2_ACCESS_TOKEN`
+- `X_OAUTH2_CLIENT_ID`, `X_OAUTH2_CLIENT_SECRET`, `X_OAUTH2_REDIRECT_URI` (for token refresh)
+
+## Configuration
+
+Config is stored at `~/.config/xpost/config.json` by default. Override with `XPOST_CONFIG` env.
+
+All settings can be overridden via environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `XPOST_CONFIG` | Config file path | `~/.config/xpost/config.json` |
+| `XPOST_ADDR` | HTTP server listen address | `:8080` |
+| `XPOST_API_TOKEN` | API token for HTTP endpoint | Auto-generated |
+| `X_OAUTH2_CLIENT_ID` | OAuth2 Client ID | |
+| `X_OAUTH2_CLIENT_SECRET` | OAuth2 Client Secret | |
+| `X_OAUTH2_REDIRECT_URI` | OAuth2 Redirect URI | `http://localhost:9100` |
+| `X_OAUTH2_SCOPE` | OAuth2 scopes (comma-separated) | `tweet.read,tweet.write,users.read,offline.access` |
+
+OAuth1 credentials are also supported as an alternative authentication method:
+
+| Variable | Description |
+|----------|-------------|
+| `X_API_KEY` | OAuth1 API Key |
+| `X_API_SECRET` | OAuth1 API Secret |
+| `X_ACCESS_TOKEN` | OAuth1 Access Token |
+| `X_ACCESS_TOKEN_SECRET` | OAuth1 Access Token Secret |
+
+## License
+
+[Apache-2.0](LICENSE)

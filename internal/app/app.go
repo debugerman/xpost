@@ -26,11 +26,19 @@ import (
 )
 
 const (
-	defaultConfigPath = "config.json"
-	defaultServerAddr = ":8080"
-	maxMediaCount     = 4
-	maxMediaBytes     = 8 * 1024 * 1024
+	defaultServerAddr  = ":8080"
+	defaultRedirectURI = "http://localhost:9100"
+	maxMediaCount      = 4
+	maxMediaBytes      = 8 * 1024 * 1024
 )
+
+func defaultConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "config.json"
+	}
+	return filepath.Join(home, ".config", "xpost", "config.json")
+}
 
 type Config struct {
 	Server   ServerConfig   `json:"server"`
@@ -47,11 +55,18 @@ type SecurityConfig struct {
 }
 
 type XAuthConfig struct {
-	APIKey            string `json:"api_key,omitempty"`
-	APISecret         string `json:"api_secret,omitempty"`
-	AccessToken       string `json:"access_token,omitempty"`
-	AccessTokenSecret string `json:"access_token_secret,omitempty"`
-	OAuth2AccessToken string `json:"oauth2_access_token,omitempty"`
+	APIKey             string   `json:"api_key,omitempty"`
+	APISecret          string   `json:"api_secret,omitempty"`
+	AccessToken        string   `json:"access_token,omitempty"`
+	AccessTokenSecret  string   `json:"access_token_secret,omitempty"`
+	OAuth2ClientID     string   `json:"oauth2_client_id,omitempty"`
+	OAuth2ClientSecret string   `json:"oauth2_client_secret,omitempty"`
+	OAuth2RedirectURI  string   `json:"oauth2_redirect_uri,omitempty"`
+	OAuth2Scope        []string `json:"oauth2_scope,omitempty"`
+	OAuth2AccessToken  string   `json:"oauth2_access_token,omitempty"`
+	OAuth2RefreshToken string   `json:"oauth2_refresh_token,omitempty"`
+	OAuth2TokenType    string   `json:"oauth2_token_type,omitempty"`
+	OAuth2ExpiresAt    int64    `json:"oauth2_expires_at,omitempty"`
 }
 
 type App struct {
@@ -73,18 +88,6 @@ type MediaRef struct {
 	MediaKey string `json:"media_key,omitempty"`
 }
 
-type updateAuthRequest struct {
-	APIKey            string `json:"api_key"`
-	APISecret         string `json:"api_secret"`
-	AccessToken       string `json:"access_token"`
-	AccessTokenSecret string `json:"access_token_secret"`
-	OAuth2AccessToken string `json:"oauth2_access_token"`
-}
-
-type rotateTokenRequest struct {
-	APIToken string `json:"api_token"`
-}
-
 type createTweetJSONRequest struct {
 	Text              string   `json:"text"`
 	MediaBase64       []string `json:"media_base64"`
@@ -99,7 +102,7 @@ type mediaUploadInput struct {
 func RunLocal() error {
 	configPath := os.Getenv("XPOST_CONFIG")
 	if strings.TrimSpace(configPath) == "" {
-		configPath = defaultConfigPath
+		configPath = defaultConfigPath()
 	}
 
 	cfg, firstBoot, err := loadOrInitConfig(configPath)
@@ -125,11 +128,11 @@ func RunLocal() error {
 	app.refreshPoster()
 
 	if firstBoot {
-		log.Printf("first boot: initialized config at %s", configPath)
+		log.Printf("first boot: config initialized at %s", configPath)
 		if strings.TrimSpace(os.Getenv("XPOST_API_TOKEN")) == "" {
-			log.Printf("first boot API token (auto-generated): %s", cfg.Security.APIToken)
+			log.Printf("first boot: API token auto-generated, see config file")
 		} else {
-			log.Printf("first boot API token loaded from XPOST_API_TOKEN")
+			log.Printf("first boot: API token loaded from XPOST_API_TOKEN")
 		}
 	}
 	if app.posterErr != nil {
@@ -176,17 +179,10 @@ func newRouter(app *App) *gin.Engine {
 		c.Status(http.StatusNoContent)
 	})
 
-	router.GET("/healthz", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
-
 	protected := router.Group("/")
 	protected.Use(app.authMiddleware())
 	{
 		protected.POST("/v1/tweets", app.handleCreateTweet)
-		protected.GET("/v1/admin/config", app.handleGetConfig)
-		protected.PUT("/v1/admin/auth", app.handleUpdateAuth)
-		protected.POST("/v1/admin/api-token/rotate", app.handleRotateToken)
 	}
 
 	return router
@@ -195,7 +191,7 @@ func newRouter(app *App) *gin.Engine {
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
+		c.Header("Access-Control-Allow-Methods", "POST,OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Authorization,Content-Type,X-API-Token")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -287,15 +283,38 @@ func overrideConfigFromEnv(cfg *Config) {
 	if v := strings.TrimSpace(os.Getenv("X_ACCESS_TOKEN_SECRET")); v != "" {
 		cfg.X.AccessTokenSecret = v
 	}
+	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_CLIENT_ID")); v != "" {
+		cfg.X.OAuth2ClientID = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_CLIENT_SECRET")); v != "" {
+		cfg.X.OAuth2ClientSecret = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_REDIRECT_URI")); v != "" {
+		cfg.X.OAuth2RedirectURI = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_SCOPE")); v != "" {
+		cfg.X.OAuth2Scope = splitCSV(v)
+	}
 	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_ACCESS_TOKEN")); v != "" {
 		cfg.X.OAuth2AccessToken = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_REFRESH_TOKEN")); v != "" {
+		cfg.X.OAuth2RefreshToken = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_TOKEN_TYPE")); v != "" {
+		cfg.X.OAuth2TokenType = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_EXPIRES_AT")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			cfg.X.OAuth2ExpiresAt = n
+		}
 	}
 }
 
 func generateToken() string {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
-		return fmt.Sprintf("xpost-%d", time.Now().UnixNano())
+		panic(fmt.Sprintf("crypto/rand.Read failed: %v", err))
 	}
 	return base64.RawURLEncoding.EncodeToString(buf)
 }
@@ -311,6 +330,8 @@ func ensureFirstBootAuthConfigured(cfg XAuthConfig) error {
 }
 
 func (a *App) refreshPoster() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	poster, err := newPoster(a.cfg.X)
 	a.poster = poster
 	a.posterErr = err
@@ -334,9 +355,17 @@ func newPoster(authCfg XAuthConfig) (*Poster, error) {
 	}
 
 	if strings.TrimSpace(authCfg.OAuth2AccessToken) != "" {
-		client := xdk.NewClient(xdk.Config{
+		clientCfg := xdk.Config{
 			AccessToken: authCfg.OAuth2AccessToken,
-		})
+		}
+		if strings.TrimSpace(authCfg.OAuth2ClientID) != "" {
+			clientCfg.ClientID = strings.TrimSpace(authCfg.OAuth2ClientID)
+			clientCfg.ClientSecret = strings.TrimSpace(authCfg.OAuth2ClientSecret)
+			clientCfg.RedirectURI = strings.TrimSpace(authCfg.OAuth2RedirectURI)
+			clientCfg.Scope = effectiveOAuth2Scopes(authCfg.OAuth2Scope)
+			clientCfg.Token = oauth2TokenFromConfig(authCfg)
+		}
+		client := xdk.NewClient(clientCfg)
 		return &Poster{client: client, authMode: "oauth2_user_token"}, nil
 	}
 
@@ -414,121 +443,22 @@ func (a *App) getPoster() (*Poster, error) {
 	return a.poster, nil
 }
 
-func (a *App) handleGetConfig(c *gin.Context) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	c.JSON(http.StatusOK, gin.H{
-		"server":     a.cfg.Server,
-		"auth_mode":  authModeOf(a.poster),
-		"x_ready":    a.poster != nil,
-		"x_last_err": errString(a.posterErr),
-		"x": gin.H{
-			"api_key_set":             strings.TrimSpace(a.cfg.X.APIKey) != "",
-			"api_secret_set":          strings.TrimSpace(a.cfg.X.APISecret) != "",
-			"access_token_set":        strings.TrimSpace(a.cfg.X.AccessToken) != "",
-			"access_token_secret_set": strings.TrimSpace(a.cfg.X.AccessTokenSecret) != "",
-			"oauth2_access_token_set": strings.TrimSpace(a.cfg.X.OAuth2AccessToken) != "",
-		},
-	})
-}
-
-func authModeOf(p *Poster) string {
-	if p == nil {
-		return ""
-	}
-	return p.authMode
-}
-
-func errString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-
-func (a *App) handleUpdateAuth(c *gin.Context) {
-	var req updateAuthRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	if strings.TrimSpace(req.APIKey) == "" &&
-		strings.TrimSpace(req.APISecret) == "" &&
-		strings.TrimSpace(req.AccessToken) == "" &&
-		strings.TrimSpace(req.AccessTokenSecret) == "" &&
-		strings.TrimSpace(req.OAuth2AccessToken) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "empty request"})
-		return
-	}
-
-	a.mu.Lock()
-	if strings.TrimSpace(req.APIKey) != "" {
-		a.cfg.X.APIKey = strings.TrimSpace(req.APIKey)
-	}
-	if strings.TrimSpace(req.APISecret) != "" {
-		a.cfg.X.APISecret = strings.TrimSpace(req.APISecret)
-	}
-	if strings.TrimSpace(req.AccessToken) != "" {
-		a.cfg.X.AccessToken = strings.TrimSpace(req.AccessToken)
-	}
-	if strings.TrimSpace(req.AccessTokenSecret) != "" {
-		a.cfg.X.AccessTokenSecret = strings.TrimSpace(req.AccessTokenSecret)
-	}
-	if strings.TrimSpace(req.OAuth2AccessToken) != "" {
-		a.cfg.X.OAuth2AccessToken = strings.TrimSpace(req.OAuth2AccessToken)
-	}
-
-	a.refreshPoster()
-	cfgCopy := *a.cfg
-	poster := a.poster
-	posterErr := a.posterErr
-	a.mu.Unlock()
-
-	if err := a.persistConfig(&cfgCopy); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"ok":         true,
-		"x_ready":    poster != nil,
-		"auth_mode":  authModeOf(poster),
-		"x_last_err": errString(posterErr),
-	})
-}
-
-func (a *App) handleRotateToken(c *gin.Context) {
-	var req rotateTokenRequest
-	_ = c.ShouldBindJSON(&req)
-
-	newToken := strings.TrimSpace(req.APIToken)
-	if newToken == "" {
-		newToken = generateToken()
-	}
-
-	a.mu.Lock()
-	a.cfg.Security.APIToken = newToken
-	cfgCopy := *a.cfg
-	a.mu.Unlock()
-
-	if err := a.persistConfig(&cfgCopy); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"ok":        true,
-		"api_token": newToken,
-	})
-}
-
 func (a *App) persistConfig(cfg *Config) error {
 	if !a.persistCfg || strings.TrimSpace(a.configPath) == "" {
 		return nil
 	}
 	return saveConfig(a.configPath, cfg)
+}
+
+func (a *App) persistOAuth2Token(poster *Poster) {
+	if !a.persistCfg || strings.TrimSpace(a.configPath) == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := persistOAuth2TokenIfAvailable(a.cfg, a.configPath, poster.client); err != nil {
+		log.Printf("warning: failed to persist refreshed oauth2 token: %v", err)
+	}
 }
 
 func (a *App) handleCreateTweet(c *gin.Context) {
@@ -562,6 +492,8 @@ func (a *App) handleCreateTweet(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
+
+	a.persistOAuth2Token(poster)
 
 	c.JSON(http.StatusOK, gin.H{
 		"ok":          true,
@@ -823,7 +755,7 @@ func (p *Poster) uploadMediaV1(ctx context.Context, data []byte, contentType str
 	}
 	defer resp.Body.Close()
 
-	payload, err := io.ReadAll(resp.Body)
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	if err != nil {
 		return MediaRef{}, err
 	}
@@ -986,4 +918,49 @@ func stringify(v any) string {
 	default:
 		return ""
 	}
+}
+
+func splitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	return uniqueNonEmpty(out)
+}
+
+func effectiveOAuth2Scopes(scopes []string) []string {
+	if len(scopes) == 0 {
+		return []string{"tweet.read", "tweet.write", "users.read", "offline.access"}
+	}
+	return uniqueNonEmpty(scopes)
+}
+
+func oauth2TokenFromConfig(cfg XAuthConfig) map[string]any {
+	token := map[string]any{
+		"access_token": strings.TrimSpace(cfg.OAuth2AccessToken),
+	}
+	if token["access_token"] == "" {
+		return nil
+	}
+	if v := strings.TrimSpace(cfg.OAuth2RefreshToken); v != "" {
+		token["refresh_token"] = v
+	}
+	if v := strings.TrimSpace(cfg.OAuth2TokenType); v != "" {
+		token["token_type"] = v
+	}
+	if v := strings.Join(cfg.OAuth2Scope, " "); strings.TrimSpace(v) != "" {
+		token["scope"] = strings.TrimSpace(v)
+	}
+	if cfg.OAuth2ExpiresAt > 0 {
+		token["expires_at"] = cfg.OAuth2ExpiresAt
+	}
+	return token
 }

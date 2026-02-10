@@ -19,7 +19,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if initErr != nil {
-		http.Error(w, initErr.Error(), http.StatusInternalServerError)
+		http.Error(w, "service initialization failed", http.StatusInternalServerError)
 		return
 	}
 	httpHandle.ServeHTTP(w, r)
