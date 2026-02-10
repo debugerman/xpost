@@ -1,0 +1,8 @@
+.git
+.github
+config.json
+.env
+.env.*
+*.log
+tmp
+test-artifacts

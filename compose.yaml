@@ -1,0 +1,26 @@
+services:
+  xpost:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xpost:latest
+    container_name: xpost
+    restart: unless-stopped
+    environment:
+      XPOST_ADDR: ":8080"
+      XPOST_CONFIG: "/data/config.json"
+      XPOST_API_TOKEN: "replace-with-strong-token"
+      # OAuth1 (recommended)
+      X_API_KEY: "replace-with-x-api-key"
+      X_API_SECRET: "replace-with-x-api-secret"
+      X_ACCESS_TOKEN: "replace-with-x-access-token"
+      X_ACCESS_TOKEN_SECRET: "replace-with-x-access-token-secret"
+      # OAuth2 alternative (optional)
+      X_OAUTH2_ACCESS_TOKEN: ""
+    ports:
+      - "8080:8080"
+    volumes:
+      - xpost_data:/data
+
+volumes:
+  xpost_data:

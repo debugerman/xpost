@@ -1,0 +1,975 @@
+package app
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"mime/multipart"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	xdk "github.com/missuo/xdk-go"
+)
+
+const (
+	defaultConfigPath = "config.json"
+	defaultServerAddr = ":8080"
+	maxMediaCount     = 4
+	maxMediaBytes     = 8 * 1024 * 1024
+)
+
+type Config struct {
+	Server   ServerConfig   `json:"server"`
+	Security SecurityConfig `json:"security"`
+	X        XAuthConfig    `json:"x"`
+}
+
+type ServerConfig struct {
+	Addr string `json:"addr"`
+}
+
+type SecurityConfig struct {
+	APIToken string `json:"api_token"`
+}
+
+type XAuthConfig struct {
+	APIKey            string `json:"api_key,omitempty"`
+	APISecret         string `json:"api_secret,omitempty"`
+	AccessToken       string `json:"access_token,omitempty"`
+	AccessTokenSecret string `json:"access_token_secret,omitempty"`
+	OAuth2AccessToken string `json:"oauth2_access_token,omitempty"`
+}
+
+type App struct {
+	mu         sync.RWMutex
+	cfg        *Config
+	configPath string
+	persistCfg bool
+	poster     *Poster
+	posterErr  error
+}
+
+type Poster struct {
+	client   *xdk.Client
+	authMode string
+}
+
+type MediaRef struct {
+	ID       string `json:"id,omitempty"`
+	MediaKey string `json:"media_key,omitempty"`
+}
+
+type updateAuthRequest struct {
+	APIKey            string `json:"api_key"`
+	APISecret         string `json:"api_secret"`
+	AccessToken       string `json:"access_token"`
+	AccessTokenSecret string `json:"access_token_secret"`
+	OAuth2AccessToken string `json:"oauth2_access_token"`
+}
+
+type rotateTokenRequest struct {
+	APIToken string `json:"api_token"`
+}
+
+type createTweetJSONRequest struct {
+	Text              string   `json:"text"`
+	MediaBase64       []string `json:"media_base64"`
+	MediaContentTypes []string `json:"media_content_types"`
+}
+
+type mediaUploadInput struct {
+	Data        []byte
+	ContentType string
+}
+
+func RunLocal() error {
+	configPath := os.Getenv("XPOST_CONFIG")
+	if strings.TrimSpace(configPath) == "" {
+		configPath = defaultConfigPath
+	}
+
+	cfg, firstBoot, err := loadOrInitConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize config: %w", err)
+	}
+
+	overrideConfigFromEnv(cfg)
+	if firstBoot {
+		if err := ensureFirstBootAuthConfigured(cfg.X); err != nil {
+			return fmt.Errorf("first boot credential check failed: %w", err)
+		}
+		if err := saveConfig(configPath, cfg); err != nil {
+			return fmt.Errorf("failed to persist first boot config: %w", err)
+		}
+	}
+
+	app := &App{
+		cfg:        cfg,
+		configPath: configPath,
+		persistCfg: true,
+	}
+	app.refreshPoster()
+
+	if firstBoot {
+		log.Printf("first boot: initialized config at %s", configPath)
+		if strings.TrimSpace(os.Getenv("XPOST_API_TOKEN")) == "" {
+			log.Printf("first boot API token (auto-generated): %s", cfg.Security.APIToken)
+		} else {
+			log.Printf("first boot API token loaded from XPOST_API_TOKEN")
+		}
+	}
+	if app.posterErr != nil {
+		log.Printf("x auth is not ready yet: %v", app.posterErr)
+	}
+
+	router := newRouter(app)
+	log.Printf("server listening on %s", cfg.Server.Addr)
+	return router.Run(cfg.Server.Addr)
+}
+
+func NewVercelHandler() (http.Handler, error) {
+	cfg := &Config{
+		Server: ServerConfig{
+			Addr: defaultServerAddr,
+		},
+	}
+	overrideConfigFromEnv(cfg)
+	if strings.TrimSpace(cfg.Security.APIToken) == "" {
+		return nil, errors.New("XPOST_API_TOKEN is required in Vercel environment")
+	}
+	if err := ensureFirstBootAuthConfigured(cfg.X); err != nil {
+		return nil, err
+	}
+
+	app := &App{
+		cfg:        cfg,
+		configPath: "",
+		persistCfg: false,
+	}
+	app.refreshPoster()
+	if app.posterErr != nil {
+		return nil, app.posterErr
+	}
+	return newRouter(app), nil
+}
+
+func newRouter(app *App) *gin.Engine {
+	router := gin.New()
+	router.Use(gin.Logger(), gin.Recovery(), corsMiddleware())
+
+	router.OPTIONS("/*any", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	router.GET("/healthz", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	protected := router.Group("/")
+	protected.Use(app.authMiddleware())
+	{
+		protected.POST("/v1/tweets", app.handleCreateTweet)
+		protected.GET("/v1/admin/config", app.handleGetConfig)
+		protected.PUT("/v1/admin/auth", app.handleUpdateAuth)
+		protected.POST("/v1/admin/api-token/rotate", app.handleRotateToken)
+	}
+
+	return router
+}
+
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Authorization,Content-Type,X-API-Token")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+func loadOrInitConfig(path string) (*Config, bool, error) {
+	path = filepath.Clean(path)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, false, err
+	}
+
+	cfg := &Config{
+		Server: ServerConfig{
+			Addr: defaultServerAddr,
+		},
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			cfg.Security.APIToken = generateToken()
+			if err := saveConfig(path, cfg); err != nil {
+				return nil, false, err
+			}
+			return cfg, true, nil
+		}
+		return nil, false, err
+	}
+
+	if len(strings.TrimSpace(string(content))) > 0 {
+		if err := json.Unmarshal(content, cfg); err != nil {
+			return nil, false, err
+		}
+	}
+
+	changed := false
+	if strings.TrimSpace(cfg.Server.Addr) == "" {
+		cfg.Server.Addr = defaultServerAddr
+		changed = true
+	}
+	if strings.TrimSpace(cfg.Security.APIToken) == "" {
+		cfg.Security.APIToken = generateToken()
+		changed = true
+	}
+
+	if changed {
+		if err := saveConfig(path, cfg); err != nil {
+			return nil, false, err
+		}
+	}
+
+	return cfg, false, nil
+}
+
+func saveConfig(path string, cfg *Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func overrideConfigFromEnv(cfg *Config) {
+	if v := strings.TrimSpace(os.Getenv("XPOST_ADDR")); v != "" {
+		cfg.Server.Addr = v
+	}
+	if v := strings.TrimSpace(os.Getenv("XPOST_API_TOKEN")); v != "" {
+		cfg.Security.APIToken = v
+	}
+
+	if v := strings.TrimSpace(os.Getenv("X_API_KEY")); v != "" {
+		cfg.X.APIKey = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_API_SECRET")); v != "" {
+		cfg.X.APISecret = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_ACCESS_TOKEN")); v != "" {
+		cfg.X.AccessToken = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_ACCESS_TOKEN_SECRET")); v != "" {
+		cfg.X.AccessTokenSecret = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_ACCESS_TOKEN")); v != "" {
+		cfg.X.OAuth2AccessToken = v
+	}
+}
+
+func generateToken() string {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("xpost-%d", time.Now().UnixNano())
+	}
+	return base64.RawURLEncoding.EncodeToString(buf)
+}
+
+func ensureFirstBootAuthConfigured(cfg XAuthConfig) error {
+	if strings.TrimSpace(cfg.OAuth2AccessToken) != "" {
+		return nil
+	}
+	if len(missingOAuth1Fields(cfg)) == 0 {
+		return nil
+	}
+	return errors.New("set OAuth1 credentials via X_API_KEY/X_API_SECRET/X_ACCESS_TOKEN/X_ACCESS_TOKEN_SECRET, or set X_OAUTH2_ACCESS_TOKEN")
+}
+
+func (a *App) refreshPoster() {
+	poster, err := newPoster(a.cfg.X)
+	a.poster = poster
+	a.posterErr = err
+}
+
+func newPoster(authCfg XAuthConfig) (*Poster, error) {
+	if hasAnyOAuth1Fields(authCfg) {
+		if missing := missingOAuth1Fields(authCfg); len(missing) > 0 {
+			return nil, fmt.Errorf("incomplete OAuth1 config, missing: %s", strings.Join(missing, ", "))
+		}
+
+		oauth1 := xdk.NewOAuth1(
+			authCfg.APIKey,
+			authCfg.APISecret,
+			"",
+			authCfg.AccessToken,
+			authCfg.AccessTokenSecret,
+		)
+		client := xdk.NewClient(xdk.Config{Auth: oauth1})
+		return &Poster{client: client, authMode: "oauth1"}, nil
+	}
+
+	if strings.TrimSpace(authCfg.OAuth2AccessToken) != "" {
+		client := xdk.NewClient(xdk.Config{
+			AccessToken: authCfg.OAuth2AccessToken,
+		})
+		return &Poster{client: client, authMode: "oauth2_user_token"}, nil
+	}
+
+	return nil, errors.New("missing x auth configuration (set OAuth1 fields or oauth2_access_token)")
+}
+
+func hasAnyOAuth1Fields(cfg XAuthConfig) bool {
+	return strings.TrimSpace(cfg.APIKey) != "" ||
+		strings.TrimSpace(cfg.APISecret) != "" ||
+		strings.TrimSpace(cfg.AccessToken) != "" ||
+		strings.TrimSpace(cfg.AccessTokenSecret) != ""
+}
+
+func missingOAuth1Fields(cfg XAuthConfig) []string {
+	var missing []string
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		missing = append(missing, "api_key")
+	}
+	if strings.TrimSpace(cfg.APISecret) == "" {
+		missing = append(missing, "api_secret")
+	}
+	if strings.TrimSpace(cfg.AccessToken) == "" {
+		missing = append(missing, "access_token")
+	}
+	if strings.TrimSpace(cfg.AccessTokenSecret) == "" {
+		missing = append(missing, "access_token_secret")
+	}
+	return missing
+}
+
+func (a *App) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		expected := a.getAPIToken()
+		if expected == "" {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"error": "api token is not configured",
+			})
+			return
+		}
+
+		got := readTokenFromRequest(c.Request)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"error": "invalid api token",
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
+func readTokenFromRequest(r *http.Request) string {
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(authHeader) > 7 && strings.EqualFold(authHeader[:7], "Bearer ") {
+		return strings.TrimSpace(authHeader[7:])
+	}
+	return strings.TrimSpace(r.Header.Get("X-API-Token"))
+}
+
+func (a *App) getAPIToken() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.cfg.Security.APIToken
+}
+
+func (a *App) getPoster() (*Poster, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.poster == nil {
+		if a.posterErr != nil {
+			return nil, a.posterErr
+		}
+		return nil, errors.New("x client is not ready")
+	}
+	return a.poster, nil
+}
+
+func (a *App) handleGetConfig(c *gin.Context) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	c.JSON(http.StatusOK, gin.H{
+		"server":     a.cfg.Server,
+		"auth_mode":  authModeOf(a.poster),
+		"x_ready":    a.poster != nil,
+		"x_last_err": errString(a.posterErr),
+		"x": gin.H{
+			"api_key_set":             strings.TrimSpace(a.cfg.X.APIKey) != "",
+			"api_secret_set":          strings.TrimSpace(a.cfg.X.APISecret) != "",
+			"access_token_set":        strings.TrimSpace(a.cfg.X.AccessToken) != "",
+			"access_token_secret_set": strings.TrimSpace(a.cfg.X.AccessTokenSecret) != "",
+			"oauth2_access_token_set": strings.TrimSpace(a.cfg.X.OAuth2AccessToken) != "",
+		},
+	})
+}
+
+func authModeOf(p *Poster) string {
+	if p == nil {
+		return ""
+	}
+	return p.authMode
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func (a *App) handleUpdateAuth(c *gin.Context) {
+	var req updateAuthRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if strings.TrimSpace(req.APIKey) == "" &&
+		strings.TrimSpace(req.APISecret) == "" &&
+		strings.TrimSpace(req.AccessToken) == "" &&
+		strings.TrimSpace(req.AccessTokenSecret) == "" &&
+		strings.TrimSpace(req.OAuth2AccessToken) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "empty request"})
+		return
+	}
+
+	a.mu.Lock()
+	if strings.TrimSpace(req.APIKey) != "" {
+		a.cfg.X.APIKey = strings.TrimSpace(req.APIKey)
+	}
+	if strings.TrimSpace(req.APISecret) != "" {
+		a.cfg.X.APISecret = strings.TrimSpace(req.APISecret)
+	}
+	if strings.TrimSpace(req.AccessToken) != "" {
+		a.cfg.X.AccessToken = strings.TrimSpace(req.AccessToken)
+	}
+	if strings.TrimSpace(req.AccessTokenSecret) != "" {
+		a.cfg.X.AccessTokenSecret = strings.TrimSpace(req.AccessTokenSecret)
+	}
+	if strings.TrimSpace(req.OAuth2AccessToken) != "" {
+		a.cfg.X.OAuth2AccessToken = strings.TrimSpace(req.OAuth2AccessToken)
+	}
+
+	a.refreshPoster()
+	cfgCopy := *a.cfg
+	poster := a.poster
+	posterErr := a.posterErr
+	a.mu.Unlock()
+
+	if err := a.persistConfig(&cfgCopy); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":         true,
+		"x_ready":    poster != nil,
+		"auth_mode":  authModeOf(poster),
+		"x_last_err": errString(posterErr),
+	})
+}
+
+func (a *App) handleRotateToken(c *gin.Context) {
+	var req rotateTokenRequest
+	_ = c.ShouldBindJSON(&req)
+
+	newToken := strings.TrimSpace(req.APIToken)
+	if newToken == "" {
+		newToken = generateToken()
+	}
+
+	a.mu.Lock()
+	a.cfg.Security.APIToken = newToken
+	cfgCopy := *a.cfg
+	a.mu.Unlock()
+
+	if err := a.persistConfig(&cfgCopy); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":        true,
+		"api_token": newToken,
+	})
+}
+
+func (a *App) persistConfig(cfg *Config) error {
+	if !a.persistCfg || strings.TrimSpace(a.configPath) == "" {
+		return nil
+	}
+	return saveConfig(a.configPath, cfg)
+}
+
+func (a *App) handleCreateTweet(c *gin.Context) {
+	poster, err := a.getPoster()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	text, mediaInputs, err := parseTweetRequest(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+
+	uploaded := make([]MediaRef, 0, len(mediaInputs))
+	for _, input := range mediaInputs {
+		ref, err := poster.UploadMedia(ctx, input.Data, input.ContentType)
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+		uploaded = append(uploaded, ref)
+	}
+
+	tweetResp, err := poster.CreateTweet(ctx, text, uploaded)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":          true,
+		"auth_mode":   poster.authMode,
+		"media":       uploaded,
+		"tweet":       tweetResp,
+		"media_count": len(uploaded),
+	})
+}
+
+func parseTweetRequest(c *gin.Context) (string, []mediaUploadInput, error) {
+	contentType := c.GetHeader("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		return parseMultipartTweetRequest(c)
+	}
+	return parseJSONTweetRequest(c)
+}
+
+func parseMultipartTweetRequest(c *gin.Context) (string, []mediaUploadInput, error) {
+	text := strings.TrimSpace(c.PostForm("text"))
+
+	form, err := c.MultipartForm()
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid multipart request: %w", err)
+	}
+
+	files := form.File["media"]
+	if len(files) > maxMediaCount {
+		return "", nil, fmt.Errorf("too many media files, max is %d", maxMediaCount)
+	}
+	if text == "" && len(files) == 0 {
+		return "", nil, errors.New("text or media is required")
+	}
+
+	media := make([]mediaUploadInput, 0, len(files))
+	for _, fh := range files {
+		f, err := fh.Open()
+		if err != nil {
+			return "", nil, err
+		}
+
+		data, readErr := io.ReadAll(io.LimitReader(f, maxMediaBytes+1))
+		closeErr := f.Close()
+		if readErr != nil {
+			return "", nil, readErr
+		}
+		if closeErr != nil {
+			return "", nil, closeErr
+		}
+		if int64(len(data)) > maxMediaBytes {
+			return "", nil, fmt.Errorf("file %q exceeds max size %d bytes", fh.Filename, maxMediaBytes)
+		}
+
+		contentType := fh.Header.Get("Content-Type")
+		if strings.TrimSpace(contentType) == "" {
+			contentType = http.DetectContentType(data)
+		}
+
+		media = append(media, mediaUploadInput{
+			Data:        data,
+			ContentType: contentType,
+		})
+	}
+
+	return text, media, nil
+}
+
+func parseJSONTweetRequest(c *gin.Context) (string, []mediaUploadInput, error) {
+	var req createTweetJSONRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		return "", nil, err
+	}
+
+	text := strings.TrimSpace(req.Text)
+	if text == "" && len(req.MediaBase64) == 0 {
+		return "", nil, errors.New("text or media_base64 is required")
+	}
+	if len(req.MediaBase64) > maxMediaCount {
+		return "", nil, fmt.Errorf("too many media items, max is %d", maxMediaCount)
+	}
+	if len(req.MediaContentTypes) > 0 && len(req.MediaContentTypes) != len(req.MediaBase64) {
+		return "", nil, errors.New("media_content_types length must match media_base64 length")
+	}
+
+	media := make([]mediaUploadInput, 0, len(req.MediaBase64))
+	for i, item := range req.MediaBase64 {
+		raw := strings.TrimSpace(item)
+		if raw == "" {
+			return "", nil, fmt.Errorf("media_base64[%d] is empty", i)
+		}
+		data, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil {
+			return "", nil, fmt.Errorf("media_base64[%d] decode failed: %w", i, err)
+		}
+		if int64(len(data)) > maxMediaBytes {
+			return "", nil, fmt.Errorf("media_base64[%d] exceeds max size %d bytes", i, maxMediaBytes)
+		}
+
+		contentType := ""
+		if len(req.MediaContentTypes) > 0 && strings.TrimSpace(req.MediaContentTypes[i]) != "" {
+			contentType = strings.TrimSpace(req.MediaContentTypes[i])
+		} else {
+			contentType = http.DetectContentType(data)
+		}
+
+		media = append(media, mediaUploadInput{
+			Data:        data,
+			ContentType: contentType,
+		})
+	}
+
+	return text, media, nil
+}
+
+func (p *Poster) UploadMedia(ctx context.Context, data []byte, contentType string) (MediaRef, error) {
+	encoded := base64.StdEncoding.EncodeToString(data)
+	mediaCategory := mediaCategoryFromType(contentType)
+	attemptBodies := []map[string]any{
+		{
+			"media":          encoded,
+			"media_type":     contentType,
+			"media_category": mediaCategory,
+		},
+		{
+			"media_data":     encoded,
+			"media_type":     contentType,
+			"media_category": mediaCategory,
+		},
+	}
+
+	var errs []string
+	for _, body := range attemptBodies {
+		resp, err := p.client.Media.Upload(ctx, xdk.Params{"body": body})
+		if err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		ref := extractMediaRef(resp)
+		if ref.ID != "" || ref.MediaKey != "" {
+			return ref, nil
+		}
+		errs = append(errs, "upload returned no media identifier")
+	}
+
+	ref, err := p.uploadMediaChunked(ctx, encoded, len(data), contentType)
+	if err == nil {
+		return ref, nil
+	}
+	errs = append(errs, err.Error())
+
+	if p.client != nil && p.client.Auth != nil {
+		ref, err = p.uploadMediaV1(ctx, data, contentType)
+		if err == nil {
+			return ref, nil
+		}
+		errs = append(errs, err.Error())
+	}
+
+	return MediaRef{}, fmt.Errorf("media upload failed: %s", strings.Join(errs, " | "))
+}
+
+func (p *Poster) uploadMediaChunked(ctx context.Context, encoded string, size int, contentType string) (MediaRef, error) {
+	initResp, err := p.client.Media.InitializeUpload(ctx, xdk.Params{
+		"body": map[string]any{
+			"total_bytes":    size,
+			"media_type":     contentType,
+			"media_category": mediaCategoryFromType(contentType),
+		},
+	})
+	if err != nil {
+		return MediaRef{}, err
+	}
+
+	initRef := extractMediaRef(initResp)
+	mediaID := initRef.ID
+	if mediaID == "" {
+		return MediaRef{}, errors.New("initialize_upload did not return media id")
+	}
+
+	appendBodies := []map[string]any{
+		{
+			"segment_index": 0,
+			"media":         encoded,
+		},
+		{
+			"segment_index": 0,
+			"media_data":    encoded,
+		},
+	}
+
+	var appendErr error
+	for _, body := range appendBodies {
+		_, appendErr = p.client.Media.AppendUpload(ctx, xdk.Params{
+			"id":   mediaID,
+			"body": body,
+		})
+		if appendErr == nil {
+			break
+		}
+	}
+	if appendErr != nil {
+		return MediaRef{}, appendErr
+	}
+
+	finalResp, err := p.client.Media.FinalizeUpload(ctx, xdk.Params{
+		"id": mediaID,
+	})
+	if err != nil {
+		return MediaRef{}, err
+	}
+
+	finalRef := extractMediaRef(finalResp)
+	if finalRef.ID == "" {
+		finalRef.ID = mediaID
+	}
+	if finalRef.MediaKey == "" {
+		finalRef.MediaKey = initRef.MediaKey
+	}
+	return finalRef, nil
+}
+
+func (p *Poster) uploadMediaV1(ctx context.Context, data []byte, contentType string) (MediaRef, error) {
+	const uploadURL = "https://upload.twitter.com/1.1/media/upload.json"
+	if p.client == nil || p.client.Auth == nil {
+		return MediaRef{}, errors.New("oauth1 auth is required for v1 media upload fallback")
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("media", "upload")
+	if err != nil {
+		return MediaRef{}, err
+	}
+	if _, err := part.Write(data); err != nil {
+		return MediaRef{}, err
+	}
+	if strings.TrimSpace(contentType) != "" {
+		_ = writer.WriteField("media_type", contentType)
+	}
+	if err := writer.Close(); err != nil {
+		return MediaRef{}, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL, &body)
+	if err != nil {
+		return MediaRef{}, err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	authHeader, err := p.client.Auth.BuildRequestHeader(http.MethodPost, uploadURL, "")
+	if err != nil {
+		return MediaRef{}, err
+	}
+	req.Header.Set("Authorization", authHeader)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return MediaRef{}, err
+	}
+	defer resp.Body.Close()
+
+	payload, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return MediaRef{}, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return MediaRef{}, fmt.Errorf("v1 media upload failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(payload)))
+	}
+
+	var obj any
+	if err := json.Unmarshal(payload, &obj); err != nil {
+		return MediaRef{}, fmt.Errorf("v1 media upload parse failed: %w", err)
+	}
+	ref := extractMediaRef(obj)
+	if ref.ID == "" {
+		return MediaRef{}, fmt.Errorf("v1 media upload returned no media id: %s", strings.TrimSpace(string(payload)))
+	}
+	return ref, nil
+}
+
+func mediaCategoryFromType(contentType string) string {
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	switch {
+	case strings.HasPrefix(ct, "image/"):
+		return "tweet_image"
+	case strings.HasPrefix(ct, "video/"):
+		return "tweet_video"
+	case strings.HasPrefix(ct, "audio/"):
+		return "tweet_video"
+	default:
+		return "tweet_image"
+	}
+}
+
+func (p *Poster) CreateTweet(ctx context.Context, text string, media []MediaRef) (xdk.JSON, error) {
+	body := map[string]any{}
+	if strings.TrimSpace(text) != "" {
+		body["text"] = strings.TrimSpace(text)
+	}
+
+	mediaIDs := uniqueNonEmpty(mediaIDs(media))
+	mediaKeys := uniqueNonEmpty(mediaKeys(media))
+	if len(mediaIDs) > 0 {
+		body["media"] = map[string]any{
+			"media_ids": mediaIDs,
+		}
+	}
+
+	resp, err := p.client.Posts.Create(ctx, xdk.Params{"body": body})
+	if err == nil {
+		return resp, nil
+	}
+
+	if len(mediaKeys) > 0 {
+		body["media"] = map[string]any{
+			"media_keys": mediaKeys,
+		}
+		return p.client.Posts.Create(ctx, xdk.Params{"body": body})
+	}
+
+	return nil, err
+}
+
+func mediaIDs(items []MediaRef) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.ID) != "" {
+			out = append(out, strings.TrimSpace(item.ID))
+		}
+	}
+	return out
+}
+
+func mediaKeys(items []MediaRef) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.MediaKey) != "" {
+			out = append(out, strings.TrimSpace(item.MediaKey))
+		}
+	}
+	return out
+}
+
+func uniqueNonEmpty(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func extractMediaRef(payload any) MediaRef {
+	id := findFirstByKeys(payload, map[string]struct{}{
+		"id":              {},
+		"media_id":        {},
+		"media_id_string": {},
+	})
+	key := findFirstByKeys(payload, map[string]struct{}{
+		"media_key": {},
+	})
+	return MediaRef{
+		ID:       id,
+		MediaKey: key,
+	}
+}
+
+func findFirstByKeys(payload any, keys map[string]struct{}) string {
+	switch v := payload.(type) {
+	case map[string]any:
+		for k, raw := range v {
+			lk := strings.ToLower(k)
+			if _, ok := keys[lk]; ok {
+				if s := stringify(raw); s != "" {
+					return s
+				}
+			}
+		}
+		for _, raw := range v {
+			if s := findFirstByKeys(raw, keys); s != "" {
+				return s
+			}
+		}
+	case []any:
+		for _, raw := range v {
+			if s := findFirstByKeys(raw, keys); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func stringify(v any) string {
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case fmt.Stringer:
+		return strings.TrimSpace(t.String())
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%v", t)
+	case float32, float64:
+		return fmt.Sprintf("%v", t)
+	default:
+		return ""
+	}
+}
