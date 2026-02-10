@@ -59,6 +59,7 @@ type XAuthConfig struct {
 	APISecret          string   `json:"api_secret,omitempty"`
 	AccessToken        string   `json:"access_token,omitempty"`
 	AccessTokenSecret  string   `json:"access_token_secret,omitempty"`
+	UserID             string   `json:"user_id,omitempty"`
 	OAuth2ClientID     string   `json:"oauth2_client_id,omitempty"`
 	OAuth2ClientSecret string   `json:"oauth2_client_secret,omitempty"`
 	OAuth2RedirectURI  string   `json:"oauth2_redirect_uri,omitempty"`
@@ -183,6 +184,7 @@ func newRouter(app *App) *gin.Engine {
 	protected.Use(app.authMiddleware())
 	{
 		protected.POST("/v1/tweets", app.handleCreateTweet)
+		protected.GET("/v1/timeline", app.handleGetTimeline)
 	}
 
 	return router
@@ -282,6 +284,9 @@ func overrideConfigFromEnv(cfg *Config) {
 	}
 	if v := strings.TrimSpace(os.Getenv("X_ACCESS_TOKEN_SECRET")); v != "" {
 		cfg.X.AccessTokenSecret = v
+	}
+	if v := strings.TrimSpace(os.Getenv("X_USER_ID")); v != "" {
+		cfg.X.UserID = v
 	}
 	if v := strings.TrimSpace(os.Getenv("X_OAUTH2_CLIENT_ID")); v != "" {
 		cfg.X.OAuth2ClientID = v
@@ -502,6 +507,53 @@ func (a *App) handleCreateTweet(c *gin.Context) {
 		"tweet":       tweetResp,
 		"media_count": len(uploaded),
 	})
+}
+
+func (a *App) handleGetTimeline(c *gin.Context) {
+	poster, err := a.getPoster()
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	a.mu.RLock()
+	userID := strings.TrimSpace(a.cfg.X.UserID)
+	a.mu.RUnlock()
+	if userID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "X_USER_ID is not configured"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	defer cancel()
+
+	params := xdk.Params{"id": userID}
+
+	// Forward supported query parameters to X API.
+	queryKeys := []string{
+		"max_results", "pagination_token",
+		"since_id", "until_id",
+		"start_time", "end_time",
+		"exclude",
+		"tweet.fields", "user.fields", "media.fields",
+		"expansions", "poll.fields", "place.fields",
+	}
+	for _, key := range queryKeys {
+		if v := strings.TrimSpace(c.Query(key)); v != "" {
+			paramKey := strings.ReplaceAll(key, ".", "_")
+			params[paramKey] = v
+		}
+	}
+
+	timeline, err := poster.GetTimeline(ctx, params)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+
+	a.persistOAuth2Token(poster)
+
+	c.JSON(http.StatusOK, timeline)
 }
 
 func parseTweetRequest(c *gin.Context) (string, []mediaUploadInput, error) {
@@ -817,6 +869,18 @@ func (p *Poster) CreateTweet(ctx context.Context, text string, media []MediaRef)
 	}
 
 	return nil, err
+}
+
+func (p *Poster) GetTimeline(ctx context.Context, params xdk.Params) (xdk.JSON, error) {
+	pager := p.client.Users.GetTimeline(params)
+	page, ok, err := pager.Next(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return xdk.JSON{"data": []any{}, "meta": map[string]any{"result_count": 0}}, nil
+	}
+	return page, nil
 }
 
 func mediaIDs(items []MediaRef) []string {
