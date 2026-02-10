@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -829,7 +831,9 @@ func (p *Poster) uploadMediaV1(ctx context.Context, data []byte, contentType str
 	}
 
 	var obj any
-	if err := json.Unmarshal(payload, &obj); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&obj); err != nil {
 		return MediaRef{}, fmt.Errorf("v1 media upload parse failed: %w", err)
 	}
 	ref := extractMediaRef(obj)
@@ -919,39 +923,37 @@ func uniqueNonEmpty(items []string) []string {
 }
 
 func extractMediaRef(payload any) MediaRef {
-	id := findFirstByKeys(payload, map[string]struct{}{
-		"id":              {},
-		"media_id":        {},
-		"media_id_string": {},
-	})
-	key := findFirstByKeys(payload, map[string]struct{}{
-		"media_key": {},
-	})
+	// Keep stable priority: media_id_string > media_id > id.
+	id := findFirstByPriority(payload, []string{"media_id_string", "media_id", "id"})
+	key := findFirstByPriority(payload, []string{"media_key"})
 	return MediaRef{
 		ID:       id,
 		MediaKey: key,
 	}
 }
 
-func findFirstByKeys(payload any, keys map[string]struct{}) string {
+func findFirstByPriority(payload any, keys []string) string {
 	switch v := payload.(type) {
 	case map[string]any:
-		for k, raw := range v {
-			lk := strings.ToLower(k)
-			if _, ok := keys[lk]; ok {
-				if s := stringify(raw); s != "" {
-					return s
+		// Check current level by key priority first.
+		for _, key := range keys {
+			for k, raw := range v {
+				if strings.EqualFold(k, key) {
+					if s := stringify(raw); s != "" {
+						return s
+					}
 				}
 			}
 		}
+		// Then search nested structures.
 		for _, raw := range v {
-			if s := findFirstByKeys(raw, keys); s != "" {
+			if s := findFirstByPriority(raw, keys); s != "" {
 				return s
 			}
 		}
 	case []any:
 		for _, raw := range v {
-			if s := findFirstByKeys(raw, keys); s != "" {
+			if s := findFirstByPriority(raw, keys); s != "" {
 				return s
 			}
 		}
@@ -965,10 +967,21 @@ func stringify(v any) string {
 		return strings.TrimSpace(t)
 	case fmt.Stringer:
 		return strings.TrimSpace(t.String())
+	case json.Number:
+		return strings.TrimSpace(t.String())
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return fmt.Sprintf("%v", t)
-	case float32, float64:
-		return fmt.Sprintf("%v", t)
+	case float32:
+		f := float64(t)
+		if math.Trunc(f) == f {
+			return strconv.FormatFloat(f, 'f', 0, 64)
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	case float64:
+		if math.Trunc(t) == t {
+			return strconv.FormatFloat(t, 'f', 0, 64)
+		}
+		return strconv.FormatFloat(t, 'f', -1, 64)
 	default:
 		return ""
 	}
