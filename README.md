@@ -36,6 +36,23 @@ docker run -d --name xpost \
   ghcr.io/missuo/xpost:latest
 ```
 
+## Vercel Deploy
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/missuo/xpost&project-name=xpost&repository-name=xpost&env=XPOST_API_TOKEN,X_API_KEY,X_API_SECRET,X_ACCESS_TOKEN,X_ACCESS_TOKEN_SECRET,X_OAUTH2_ACCESS_TOKEN)
+
+After import, set environment variables in Vercel:
+
+- `XPOST_API_TOKEN` (required)
+- OAuth1 (recommended):
+  - `X_API_KEY`
+  - `X_API_SECRET`
+  - `X_ACCESS_TOKEN`
+  - `X_ACCESS_TOKEN_SECRET`
+- Or OAuth2:
+  - `X_OAUTH2_ACCESS_TOKEN`
+
+Then deploy and call your production domain directly.
+
 ## Required Environment Variables
 
 ### API Protection (required)
@@ -197,24 +214,3 @@ curl -X POST http://localhost:8080/v1/tweets \
 - `400 {"error":"text or media is required"}`
 - `400 {"error":"too many media files, max is 4"}`
 - `502 {"error":"...x api error..."}`
-
-## Releases and Docker Images
-
-Both workflows trigger on **GitHub Release (published tag)**:
-
-- `.github/workflows/release.yml`:
-  - runs tests
-  - builds release binaries
-  - uploads artifacts to the GitHub Release
-
-- `.github/workflows/docker-release.yml`:
-  - builds and pushes GHCR image
-  - tags:
-    - `<release-tag>`
-    - `latest`
-
-Use pinned tag in production (recommended), for example:
-
-```yaml
-image: ghcr.io/missuo/xpost:v1.0.0
-```
