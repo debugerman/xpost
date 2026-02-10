@@ -168,6 +168,7 @@ func NewVercelHandler() (http.Handler, error) {
 }
 
 func newRouter(app *App) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery(), corsMiddleware())
 
