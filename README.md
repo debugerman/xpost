@@ -161,15 +161,16 @@ curl -X POST http://localhost:8080/v1/tweets \
 
 ## Docker Deployment
 
+Docker runs the HTTP API server with OAuth1 credentials (no interactive login needed):
+
 ```bash
 docker run -d --name xpost \
   -p 8080:8080 \
   -e XPOST_API_TOKEN="your-secret-token" \
-  -e X_OAUTH2_ACCESS_TOKEN="..." \
-  -e X_OAUTH2_REFRESH_TOKEN="..." \
-  -e X_OAUTH2_CLIENT_ID="..." \
-  -e X_OAUTH2_CLIENT_SECRET="..." \
-  -e X_OAUTH2_REDIRECT_URI="http://localhost:9100" \
+  -e X_API_KEY="your-api-key" \
+  -e X_API_SECRET="your-api-secret" \
+  -e X_ACCESS_TOKEN="your-access-token" \
+  -e X_ACCESS_TOKEN_SECRET="your-access-token-secret" \
   ghcr.io/missuo/xpost:latest
 ```
 
@@ -182,8 +183,7 @@ Or with Docker Compose — see [`compose.yaml`](compose.yaml).
 Set these environment variables in the Vercel dashboard:
 
 - `XPOST_API_TOKEN`
-- `X_OAUTH2_ACCESS_TOKEN`
-- `X_OAUTH2_CLIENT_ID`, `X_OAUTH2_CLIENT_SECRET`, `X_OAUTH2_REDIRECT_URI` (for token refresh)
+- `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET`
 
 ## Configuration
 

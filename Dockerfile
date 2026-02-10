@@ -31,4 +31,4 @@ ENV TZ=UTC
 
 EXPOSE 8080
 
-ENTRYPOINT ["/xpost"]
+ENTRYPOINT ["/xpost", "serve"]
