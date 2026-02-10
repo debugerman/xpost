@@ -116,8 +116,23 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Upload binaries and generate release notes
+      - name: Generate release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          PREV_TAG=$(gh api repos/${{ github.repository }}/releases --jq '.[].tag_name' | grep -v "^${TAG}$" | head -1) || true
+          BODY=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name="${TAG}" \
+            ${PREV_TAG:+-f previous_tag_name="${PREV_TAG}"} \
+            --jq '.body')
+          echo "body<<RELEASE_NOTES_EOF" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_NOTES_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binaries and update release body
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
-          generate_release_notes: true
+          body: ${{ steps.notes.outputs.body }}
