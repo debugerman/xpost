@@ -1,9 +1,7 @@
 services:
   xpost:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: xpost:latest
+    image: ghcr.io/missuo/xpost:latest
+    pull_policy: always
     container_name: xpost
     restart: unless-stopped
     environment:
