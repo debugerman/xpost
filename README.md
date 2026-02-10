@@ -38,18 +38,15 @@ docker run -d --name xpost \
 
 ## Vercel Deploy
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/missuo/xpost&project-name=xpost&repository-name=xpost&env=XPOST_API_TOKEN,X_API_KEY,X_API_SECRET,X_ACCESS_TOKEN,X_ACCESS_TOKEN_SECRET,X_OAUTH2_ACCESS_TOKEN)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/missuo/xpost&project-name=xpost&repository-name=xpost&env=XPOST_API_TOKEN,X_API_KEY,X_API_SECRET,X_ACCESS_TOKEN,X_ACCESS_TOKEN_SECRET)
 
 After import, set environment variables in Vercel:
 
 - `XPOST_API_TOKEN` (required)
-- OAuth1 (recommended):
-  - `X_API_KEY`
-  - `X_API_SECRET`
-  - `X_ACCESS_TOKEN`
-  - `X_ACCESS_TOKEN_SECRET`
-- Or OAuth2:
-  - `X_OAUTH2_ACCESS_TOKEN`
+- `X_API_KEY` (required)
+- `X_API_SECRET` (required)
+- `X_ACCESS_TOKEN` (required)
+- `X_ACCESS_TOKEN_SECRET` (required)
 
 Then deploy and call your production domain directly.
 
@@ -59,18 +56,12 @@ Then deploy and call your production domain directly.
 
 - `XPOST_API_TOKEN`
 
-### X Credentials (choose one mode)
-
-OAuth1 (recommended):
+### X Credentials (required)
 
 - `X_API_KEY`
 - `X_API_SECRET`
 - `X_ACCESS_TOKEN`
 - `X_ACCESS_TOKEN_SECRET`
-
-OAuth2 alternative:
-
-- `X_OAUTH2_ACCESS_TOKEN`
 
 ### Optional
 
